@@ -1,0 +1,85 @@
+# MedPromptFolio Default Configuration
+# =====================================
+
+# Model Configuration
+model:
+  name: "medpromptfolio"
+  medclip_checkpoint: "/home/pinak/MedClip/proj1/pretrained/medclip-vit"
+  n_ctx: 8  # Number of context tokens
+  num_prompts: 2  # 1 global + 1 local
+  class_specific_context: false
+  proj_dim: 512
+
+# Portfolio Configuration
+portfolio:
+  theta: 0.3  # Mixing coefficient: 0=fully global, 1=fully local
+  # Theoretical optimal theta for medical imaging:
+  # theta* = (1 - SNR_local) / (1 - SNR_global + 1 - SNR_local)
+  # Expected: ~0.3-0.4 for medical data (higher heterogeneity)
+
+# Federated Learning Configuration
+federated:
+  num_clients: 4
+  num_rounds: 50
+  local_epochs: 1
+  client_fraction: 1.0  # Fraction of clients per round
+  aggregation: "weighted_average"  # Options: weighted_average, uniform
+
+# Training Configuration
+training:
+  lr: 0.002
+  weight_decay: 0.0
+  batch_size: 32
+  optimizer: "adamw"
+  scheduler: "cosine"
+  warmup_rounds: 5
+  use_amp: true  # Automatic mixed precision
+
+# Data Configuration
+data:
+  tasks:
+    - "Atelectasis"
+    - "Cardiomegaly"
+    - "Consolidation"
+    - "Edema"
+    - "Pleural Effusion"
+  img_size: 224
+  num_workers: 4
+  uncertainty_policy: "ones"  # How to handle uncertain labels
+
+# Dataset Paths (update these for your setup)
+datasets:
+  chexpert:
+    root: "/data/chexpert"
+    name: "CheXpert"
+    hospital: "Stanford"
+  mimic_cxr:
+    root: "/data/mimic-cxr"
+    name: "MIMIC-CXR"
+    hospital: "Beth Israel"
+  nih_chestxray:
+    root: "/data/nih-chestxray"
+    name: "NIH ChestX-ray14"
+    hospital: "NIH"
+  vindr_cxr:
+    root: "/data/vindr-cxr"
+    name: "VinDr-CXR"
+    hospital: "Vietnam"
+
+# Evaluation Configuration
+evaluation:
+  metrics:
+    - "auc"
+    - "accuracy"
+    - "f1"
+  per_class: true
+  save_predictions: false
+
+# Output Configuration
+output:
+  dir: "./output"
+  save_frequency: 10  # Save checkpoint every N rounds
+  log_frequency: 1
+
+# Random Seed
+seed: 42
