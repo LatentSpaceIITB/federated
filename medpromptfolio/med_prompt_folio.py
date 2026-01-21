@@ -38,7 +38,7 @@ class MedPromptFolio(nn.Module):
         classnames: List[str] = None,
         medclip_checkpoint: str = None,
         n_ctx: int = 8,
-        theta: float = 0.3,
+        theta: float = 0.2,  # Paper optimal value
         class_specific_context: bool = False,
         device: str = "cuda",
     ):
@@ -69,15 +69,13 @@ class MedPromptFolio(nn.Module):
             theta=theta,
         )
 
-        # Loss function for multi-label classification
-        self.loss_fn = nn.BCEWithLogitsLoss()
-
         # Gradient scaler for mixed precision
         self.scaler = GradScaler()
 
         # Local state storage for federated learning
         self.local_info = {}
         self.global_info = None
+        self.global_logit_scale = None
 
     def forward(self, pixel_values: torch.Tensor, labels: torch.Tensor = None):
         """
@@ -127,17 +125,25 @@ class MedPromptFolio(nn.Module):
         - Global prompt (index 0) comes from aggregated global
         - Local prompt (index 1) comes from client's local history
         """
-        if client_id in self.local_info:
-            # Load client's local prompts
-            local_state = self.local_info[client_id]
-            self.load_prompt_state_dict(local_state)
+        # Initialize client state if first time (critical for round 1)
+        if client_id not in self.local_info:
+            self.local_info[client_id] = self.get_prompt_state_dict()
 
-            # Replace global prompt with aggregated global
-            if self.global_info is not None:
-                ctx = self.model.prompt_learner.ctx.data
-                # ctx shape: [num_prompts, n_ctx, dim] or [num_prompts * n_cls, n_ctx, dim]
-                ctx[0] = self.global_info  # Replace first (global) prompt
-                self.model.prompt_learner.ctx.data = ctx
+        # Load client's local prompts
+        local_state = self.local_info[client_id]
+        self.load_prompt_state_dict(local_state)
+
+        # Replace global prompt with aggregated global
+        if self.global_info is not None:
+            ctx = self.model.prompt_learner.ctx.data
+            # ctx shape: [num_prompts, n_ctx, dim] or [num_prompts * n_cls, n_ctx, dim]
+            # Device-safe copy to avoid device mismatch when training on GPU
+            ctx[0].copy_(self.global_info.to(ctx.device))
+            self.model.prompt_learner.ctx.data = ctx
+
+        # Also restore aggregated logit_scale if available
+        if self.global_logit_scale is not None:
+            self.model.logit_scale.data.copy_(self.global_logit_scale)
 
     def fed_aggregate_model(self, client_ids: List[int], weights: List[float] = None):
         """
@@ -156,25 +162,35 @@ class MedPromptFolio(nn.Module):
             weights = [1.0 / len(client_ids)] * len(client_ids)
 
         # Aggregate only the global prompt (index 0)
+        # FIX: Track valid weights for clients that actually have data
         global_prompts = []
-        for idx in client_ids:
+        valid_weights = []
+        for i, idx in enumerate(client_ids):
             if idx in self.local_info:
                 ctx = self.local_info[idx]['prompt_learner.ctx']
                 # Extract global prompt (first prompt)
                 global_prompts.append(ctx[0])
+                valid_weights.append(weights[i])
 
         if len(global_prompts) == 0:
             return
 
-        # Weighted average
+        # FIX: Renormalize weights to sum to 1
+        weight_sum = sum(valid_weights)
+        if weight_sum > 0:
+            valid_weights = [w / weight_sum for w in valid_weights]
+
+        # Weighted average of global prompts
         global_prompts = torch.stack(global_prompts)
-        weights_tensor = torch.tensor(weights, device=global_prompts.device).view(-1, 1, 1)
+        weights_tensor = torch.tensor(valid_weights, device=global_prompts.device).view(-1, 1, 1)
         aggregated_global = (global_prompts * weights_tensor).sum(dim=0)
 
         self.global_info = aggregated_global
 
     def set_theta(self, theta: float):
         """Update portfolio mixing coefficient."""
+        if not 0.0 <= theta <= 1.0:
+            raise ValueError(f"theta must be in [0, 1], got {theta}")
         self.theta = theta
         self.model.theta = theta
 
@@ -259,10 +275,10 @@ class MedPromptFolioTrainer:
                     outputs = self.model(images, labels)
                     loss = outputs['loss']
 
-                    # FedProx regularization
-                    if fedprox and global_weights is not None:
-                        prox_term = self._compute_fedprox_term(global_weights, mu)
-                        loss = loss + prox_term
+                # FIX: FedProx term computed OUTSIDE autocast to avoid float16 underflow
+                if fedprox and global_weights is not None:
+                    prox_term = self._compute_fedprox_term(global_weights, mu)
+                    loss = loss + prox_term.float()  # Ensure float32
 
                 self.scaler.scale(loss).backward()
                 self.scaler.step(self.optimizer)
@@ -286,6 +302,10 @@ class MedPromptFolioTrainer:
             all_preds.append(preds)
             all_labels.append(labels.cpu())
 
+        # Guard against empty batches (can happen with small client datasets)
+        if total_samples == 0:
+            return {'loss': 0.0, 'auc': 0.0, 'samples': 0}
+
         # Compute metrics
         all_preds = torch.cat(all_preds)
         all_labels = torch.cat(all_labels)
@@ -301,7 +321,8 @@ class MedPromptFolioTrainer:
 
     def _compute_fedprox_term(self, global_weights: Dict, mu: float) -> torch.Tensor:
         """Compute FedProx regularization term."""
-        prox_loss = 0.0
+        # FIX: Initialize as tensor, not Python float, to maintain proper type
+        prox_loss = torch.tensor(0.0, device=self.device)
         current_ctx = self.model.model.prompt_learner.ctx
         if 'prompt_learner.ctx' in global_weights:
             global_ctx = global_weights['prompt_learner.ctx'].to(self.device)
@@ -416,13 +437,20 @@ class FedAvgMedCLIP(MedPromptFolio):
 
         for key in ['prompt_learner.ctx', 'logit_scale']:
             values = []
-            for idx in client_ids:
+            valid_weights = []  # FIX: Track weights for valid clients only
+            for i, idx in enumerate(client_ids):
                 if idx in self.local_info and key in self.local_info[idx]:
                     values.append(self.local_info[idx][key])
+                    valid_weights.append(weights[i])
 
             if values:
+                # FIX: Renormalize weights to sum to 1
+                weight_sum = sum(valid_weights)
+                if weight_sum > 0:
+                    valid_weights = [w / weight_sum for w in valid_weights]
+
                 stacked = torch.stack(values)
-                weights_tensor = torch.tensor(weights, device=stacked.device)
+                weights_tensor = torch.tensor(valid_weights, device=stacked.device)
                 # Handle different tensor dimensions
                 for _ in range(stacked.dim() - 1):
                     weights_tensor = weights_tensor.unsqueeze(-1)
@@ -430,11 +458,21 @@ class FedAvgMedCLIP(MedPromptFolio):
 
         # Store aggregated state
         self.global_info = aggregated_state.get('prompt_learner.ctx')
+        # FIX: Also store aggregated logit_scale
+        self.global_logit_scale = aggregated_state.get('logit_scale')
 
     def fed_download_model(self, client_id: int):
         """Download aggregated model to client."""
+        # FIX: Initialize client on first encounter (critical for round 1)
+        if client_id not in self.local_info:
+            self.local_info[client_id] = self.get_prompt_state_dict()
+
         if self.global_info is not None:
             self.model.prompt_learner.ctx.data.copy_(self.global_info)
+
+        # FIX: Also restore aggregated logit_scale
+        if self.global_logit_scale is not None:
+            self.model.logit_scale.data.copy_(self.global_logit_scale)
 
 
 class FedProxMedCLIP(FedAvgMedCLIP):
@@ -466,5 +504,7 @@ class LocalOnlyMedCLIP(MedPromptFolio):
 
     def fed_download_model(self, client_id: int):
         """Just load local model."""
-        if client_id in self.local_info:
-            self.load_prompt_state_dict(self.local_info[client_id])
+        # Initialize client state if first time
+        if client_id not in self.local_info:
+            self.local_info[client_id] = self.get_prompt_state_dict()
+        self.load_prompt_state_dict(self.local_info[client_id])

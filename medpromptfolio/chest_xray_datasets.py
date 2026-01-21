@@ -868,7 +868,7 @@ class FederatedChestXrayDataset:
                 shuffle=True,
                 num_workers=self.num_workers,
                 pin_memory=True,
-                drop_last=True,
+                drop_last=False,
             )
             self.test_loaders[name] = DataLoader(
                 self.test_datasets[name],

@@ -245,13 +245,17 @@ class FederatedTrainer:
 
             if train_loader is None:
                 print(f"  Warning: No training data for client {client_id}")
+                # FIX: Still upload model even when data missing (preserves client state)
+                self.model.fed_upload_model(client_id)
                 continue
 
             # Update client data size
             if client_id not in self.client_data_sizes:
                 self.client_data_sizes[client_id] = len(train_loader.dataset)
 
-            # Local training
+            # Local training - FIX: collect metrics from all epochs and average
+            epoch_losses = []
+            epoch_aucs = []
             for epoch in range(self.local_epochs):
                 metrics = self.trainer.train_epoch(
                     train_loader,
@@ -259,9 +263,12 @@ class FederatedTrainer:
                     fedprox=(self.fedprox_mu > 0),
                     mu=self.fedprox_mu,
                 )
+                epoch_losses.append(metrics['loss'])
+                epoch_aucs.append(metrics['auc'])
 
-            round_metrics['train_loss'].append(metrics['loss'])
-            round_metrics['train_auc'].append(metrics['auc'])
+            # FIX: Report average metrics across all local epochs
+            round_metrics['train_loss'].append(np.mean(epoch_losses))
+            round_metrics['train_auc'].append(np.mean(epoch_aucs))
 
             # Upload model from client
             self.model.fed_upload_model(client_id)
@@ -270,9 +277,13 @@ class FederatedTrainer:
         weights = self.get_aggregation_weights(client_ids)
         self.model.fed_aggregate_model(client_ids, weights)
 
-        # Average metrics
-        round_metrics['avg_train_loss'] = np.mean(round_metrics['train_loss'])
-        round_metrics['avg_train_auc'] = np.mean(round_metrics['train_auc'])
+        # Average metrics (guard against empty lists if all clients skipped)
+        if round_metrics['train_loss']:
+            round_metrics['avg_train_loss'] = np.mean(round_metrics['train_loss'])
+            round_metrics['avg_train_auc'] = np.mean(round_metrics['train_auc'])
+        else:
+            round_metrics['avg_train_loss'] = 0.0
+            round_metrics['avg_train_auc'] = 0.0
 
         return round_metrics
 
@@ -461,7 +472,7 @@ def run_experiment(
     num_rounds: int = 50,
     local_epochs: int = 1,
     lr: float = 0.002,
-    theta: float = 0.3,
+    theta: float = 0.2,  # Paper optimal
     n_ctx: int = 8,
     batch_size: int = 32,
     client_fraction: float = 1.0,
